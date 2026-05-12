@@ -3,6 +3,7 @@ Interactive multi-speaker chat client for local LLM.
 Supports multiple speakers (user-controlled or LLM-driven) with round-robin turns.
 """
 
+import copy
 import curses
 import json
 import os
@@ -405,18 +406,37 @@ def curses_text_editor(stdscr, title, initial=""):
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
         stdscr.addnstr(1, 2, "Esc to save and go back", w - 4)
 
-        # Draw text
+        # Draw text with wrapping
+        text_w = w - 4  # usable width for text
+        row = 3
+        cursor_row, cursor_col = row, 2
         for i, line in enumerate(lines):
-            row = 3 + i
+            if not line:
+                # Empty line still takes a row
+                if i == cy:
+                    cursor_row, cursor_col = row, 2
+                row += 1
+                if row >= h - 1:
+                    break
+                continue
+            for chunk_start in range(0, len(line), text_w):
+                if row >= h - 1:
+                    break
+                chunk = line[chunk_start:chunk_start + text_w]
+                stdscr.addnstr(row, 2, chunk, text_w)
+                if i == cy and chunk_start <= cx < chunk_start + text_w:
+                    cursor_row = row
+                    cursor_col = 2 + (cx - chunk_start)
+                elif i == cy and cx == len(line) and chunk_start + text_w >= len(line):
+                    cursor_row = row
+                    cursor_col = 2 + (cx - chunk_start)
+                row += 1
             if row >= h - 1:
                 break
-            stdscr.addnstr(row, 2, line, w - 4)
 
         # Position cursor
-        screen_cy = 3 + cy
-        screen_cx = 2 + cx
-        if screen_cy < h and screen_cx < w:
-            stdscr.move(screen_cy, screen_cx)
+        if cursor_row < h and cursor_col < w:
+            stdscr.move(cursor_row, cursor_col)
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -602,13 +622,15 @@ def edit_speaker(stdscr, speaker):
         color_name = speaker.get("color", "White")
         speaker_cc = _curses_color_for_name(color_name)
         tts_label = "On" if speaker.get("tts", False) else "Off"
+        knows_all_label = "On" if speaker.get("knows_all", False) else "Off"
         items = [
             f"Controller ({ctrl_label})",
             f"Color: {color_name}",
             f"TTS: {tts_label}",
+            f"Knows All Speakers: {knows_all_label}",
             f"System Prompt: {prompt_preview}",
         ]
-        item_colors = [None, speaker_cc, None, None]
+        item_colors = [None, speaker_cc, None, None, None]
         idx, action = curses_menu(stdscr, f"Editing speaker: {speaker['name']}", items,
                                   title_color=speaker_cc, item_colors=item_colors)
 
@@ -638,6 +660,9 @@ def edit_speaker(stdscr, speaker):
                 # Toggle TTS
                 speaker["tts"] = not speaker.get("tts", False)
             elif idx == 3:
+                # Toggle knows_all
+                speaker["knows_all"] = not speaker.get("knows_all", False)
+            elif idx == 4:
                 # Edit system prompt
                 result = curses_text_editor(
                     stdscr,
@@ -686,12 +711,21 @@ ORDER_LABELS = {
     "orchestrator_user": "Orchestrator (User)",
 }
 
+def _config_snapshot(speakers, order, initial_prompt):
+    return copy.deepcopy(speakers), order, initial_prompt
+
+def _config_dirty(speakers, order, initial_prompt, snapshot):
+    if snapshot is None:
+        return False
+    return (speakers, order, initial_prompt) != snapshot
+
 def main_menu(stdscr):
     """Top-level menu. Returns (speakers, order) when 'Start Chat' is selected, or None to quit."""
     speakers = default_speakers()
     order = "round_robin"
     initial_prompt = ""
     config_name = None
+    saved_snapshot = None
     main_sel = 0
 
     while True:
@@ -718,7 +752,7 @@ def main_menu(stdscr):
             speaker_item,
             f"Order: {ORDER_LABELS[order]}",
             f"Initial Prompt: {prompt_preview}",
-            f"Save Configuration ({config_name})" if config_name else "Save Configuration",
+            f"Save Configuration ({config_name}){' *' if _config_dirty(speakers, order, initial_prompt, saved_snapshot) else ''}" if config_name else "Save Configuration",
             "Load Configuration",
         ]
         idx, action = curses_menu(stdscr, "Chat Client", items, allow_esc=True, start_idx=main_sel)
@@ -745,15 +779,18 @@ def main_menu(stdscr):
             elif idx == 4:
                 if config_name:
                     save_config(config_name, speakers, order, initial_prompt)
+                    saved_snapshot = _config_snapshot(speakers, order, initial_prompt)
                 else:
                     name = save_config_menu(stdscr, speakers, order, initial_prompt)
                     if name:
                         config_name = name
+                        saved_snapshot = _config_snapshot(speakers, order, initial_prompt)
             elif idx == 5:
                 result = load_config_menu(stdscr)
                 if result:
                     speakers, order, initial_prompt = result[0], result[1], result[2]
                     config_name = result[3]
+                    saved_snapshot = _config_snapshot(speakers, order, initial_prompt)
 
 
 # ─── Input Watcher (Escape + Pause) ──────────────────────────────────────────
@@ -882,6 +919,16 @@ def stream_llm_response(speaker, transcript, all_speakers, input_watcher=None):
         identity = f"You are {speaker['name']}."
     if speaker["system_prompt"]:
         identity += f" {speaker['system_prompt']}" if identity else speaker["system_prompt"]
+    if speaker.get("knows_all", False):
+        others = [s for s in all_speakers if s["name"] != speaker["name"]]
+        if others:
+            lines = []
+            for s in others:
+                desc = f"- {s['name']}"
+                if s["system_prompt"]:
+                    desc += f": {s['system_prompt']}"
+                lines.append(desc)
+            identity += f"\n\nThe other participants are:\n" + "\n".join(lines)
     if len(all_speakers) > 2 or speaker["name"] != "AI":
         identity += (
             f"\n\nIMPORTANT: Respond ONLY as {speaker['name']}. "
