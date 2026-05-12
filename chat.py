@@ -1098,7 +1098,7 @@ Valid speaker names: {', '.join(speaker_names)}"""
 
 # ─── Chat Loop ───────────────────────────────────────────────────────────────
 
-def save_transcript(transcript):
+def save_transcript(transcript, speakers=None):
     """Save the conversation transcript to ~/notes/transcripts/."""
     if not transcript:
         return
@@ -1107,7 +1107,15 @@ def save_transcript(transcript):
     filepath = os.path.join(TRANSCRIPTS_DIR, f"{timestamp}.md")
     with open(filepath, "w", encoding="utf-8") as f:
         for speaker_name, text in transcript:
-            f.write(f"{speaker_name}: {text}\n")
+            f.write(f"[{speaker_name}]: {text}\n")
+    # Save speaker metadata sidecar
+    if speakers:
+        meta_path = os.path.splitext(filepath)[0] + ".meta.json"
+        speaker_meta = {}
+        for s in speakers:
+            speaker_meta[s["name"]] = {"color": s.get("color", "White")}
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"speakers": speaker_meta}, f, indent=2)
     print(f"\033[2mTranscript saved to {filepath}\033[0m")
 
 
@@ -1279,7 +1287,7 @@ def run_chat(speakers, order, initial_prompt=""):
                     print()
                     break
 
-    save_transcript(transcript)
+    save_transcript(transcript, speakers)
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────

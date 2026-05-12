@@ -65,15 +65,70 @@ def split_sentences(text):
 
 # --- Transcript parsing ---
 
+def load_meta(filepath):
+    """Load speaker metadata sidecar (.meta.json) if it exists."""
+    meta_path = os.path.splitext(filepath)[0] + ".meta.json"
+    if os.path.exists(meta_path):
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+
+# ANSI color lookup matching chat.py's SPEAKER_COLORS
+_COLOR_ANSI = {
+    "Red": "\033[1;31m",
+    "Green": "\033[1;32m",
+    "Yellow": "\033[1;33m",
+    "Blue": "\033[1;34m",
+    "Magenta": "\033[1;35m",
+    "Cyan": "\033[1;36m",
+    "White": "\033[1;37m",
+    "Bright Red": "\033[1;91m",
+    "Bright Green": "\033[1;92m",
+    "Bright Blue": "\033[1;94m",
+}
+
+
+def speaker_ansi(speaker, meta):
+    """Return the ANSI color code for a speaker, or default cyan."""
+    if meta and "speakers" in meta:
+        info = meta["speakers"].get(speaker)
+        if info:
+            return _COLOR_ANSI.get(info.get("color", ""), "\033[1;36m")
+    return "\033[1;36m"
+
+
+def _detect_format(filepath):
+    """Detect whether a transcript uses [Name]: (new) or Name: (legacy) format.
+    Returns 'bracketed' or 'legacy'."""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            if re.match(r'^\[.+\]: ', line):
+                return "bracketed"
+            if re.match(r'^[A-Za-z][A-Za-z0-9]*(?: [A-Za-z][A-Za-z0-9]*){0,2}: ', line):
+                return "legacy"
+    return "legacy"
+
+
 def detect_tags(filepath):
-    """Scan a file and return all unique speaker tags found (e.g. ['You', 'AI']).
-    Tags must be 1-3 words and at most 30 characters."""
+    """Scan a file and return all unique speaker tags found.
+    If a .meta.json sidecar exists, use its speaker names as authoritative."""
+    meta = load_meta(filepath)
+    if meta and "speakers" in meta:
+        return list(meta["speakers"].keys())
+
+    fmt = _detect_format(filepath)
     tags = []
     seen = set()
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
-            m = re.match(r'^([A-Za-z][A-Za-z0-9]*(?: [A-Za-z][A-Za-z0-9]*){0,2}): ', line)
-            if m and len(m.group(1)) <= 30:
+            if fmt == "bracketed":
+                m = re.match(r'^\[([^\]]+)\]: ', line)
+            else:
+                m = re.match(r'^([A-Za-z][A-Za-z0-9]*(?: [A-Za-z][A-Za-z0-9]*){0,2}): ', line)
+                if m and len(m.group(1)) > 30:
+                    continue
+            if m:
                 tag = m.group(1)
                 if tag not in seen:
                     seen.add(tag)
@@ -83,13 +138,16 @@ def detect_tags(filepath):
 
 def parse_transcript(filepath):
     """Parse transcript into a list of (speaker, text, start_line) tuples.
-    Auto-detects speaker tags."""
+    Auto-detects bracketed [Name]: or legacy Name: format."""
+    fmt = _detect_format(filepath)
     tags = detect_tags(filepath)
     if not tags:
         return []
 
-    # Build regex to match any known tag at line start
-    tag_pattern = re.compile(r'^(' + '|'.join(re.escape(t) for t in tags) + r'): ')
+    if fmt == "bracketed":
+        tag_pattern = re.compile(r'^\[(' + '|'.join(re.escape(t) for t in tags) + r')\]: ')
+    else:
+        tag_pattern = re.compile(r'^(' + '|'.join(re.escape(t) for t in tags) + r'): ')
 
     with open(filepath, 'r', encoding='utf-8') as f:
         lines = f.readlines()
@@ -459,8 +517,10 @@ def _wait_while_paused(state):
         time.sleep(0.05)
 
 
-def play_prerendered(filepath, manifest, start_sentence=0):
+def play_prerendered(filepath, manifest, start_sentence=0, meta=None):
     """Play from pre-rendered audio files with spacebar pause."""
+    if meta is None:
+        meta = load_meta(filepath)
     adir = audio_dir_for(filepath)
     entries = manifest["sentences"]
     total = len(entries)
@@ -482,6 +542,7 @@ def play_prerendered(filepath, manifest, start_sentence=0):
         listener = threading.Thread(target=_input_listener, args=(state,), daemon=True)
         listener.start()
 
+        last_speaker = None
         for i in range(start_sentence, total):
             state.current_sentence = i
 
@@ -497,11 +558,17 @@ def play_prerendered(filepath, manifest, start_sentence=0):
             speaker = entry["speaker"]
             preview = entry["text"].replace('\n', ' ')
 
+            # Blank line between different speakers
+            if last_speaker is not None and speaker != last_speaker:
+                print()
+            last_speaker = speaker
+
             if entry.get("file"):
                 # Has audio — play it
                 wav_path = os.path.join(adir, entry["file"])
                 if os.path.exists(wav_path):
-                    print(f"  \033[2m[{i+1}/{total}]\033[0m \033[1;36m{speaker}:\033[0m \033[0;37m{preview}\033[0m")
+                    sc = speaker_ansi(speaker, meta)
+                    print(f"  \033[2m[{i+1}/{total}]\033[0m {sc}{speaker}:\033[0m \033[0;37m{preview}\033[0m")
                     subprocess.run(["paplay", wav_path])
 
                     if state.paused:
@@ -511,17 +578,19 @@ def play_prerendered(filepath, manifest, start_sentence=0):
 
                     time.sleep(0.3)
             else:
-                # No audio — display and pause
-                print(f"\n  \033[2m[{i+1}/{total}]\033[0m \033[1;33m{speaker}:\033[0m \033[33m{preview}\033[0m")
-                sys.stdout.write(f"\r\n  \033[1;33m\u23f8  Press space to continue...\033[0m")
+                # No audio — display in yellow and auto-pause
+                sc = speaker_ansi(speaker, meta)
+                print(f"  \033[2m[{i+1}/{total}]\033[0m {sc}{speaker}:\033[0m \033[33m{preview}\033[0m")
+                sys.stdout.write(f"\n  \033[1;37m\u23f8  Press space to continue...\033[0m")
                 sys.stdout.flush()
                 with state.lock:
                     state.paused = True
                 _wait_while_paused(state)
+                # Clear the prompt line and the blank line
+                sys.stdout.write(f"\r\033[2K\033[1A\033[2K")
+                sys.stdout.flush()
                 if state.quit:
                     break
-                sys.stdout.write(f"\r\033[2K\n")
-                sys.stdout.flush()
 
         if state.quit:
             print(f"\n\n\033[1mStopped at sentence {i+1}/{total}.\033[0m")
@@ -648,6 +717,9 @@ def story_menu(filepath):
         adir = audio_dir_for(filepath)
         if os.path.isdir(adir):
             shutil.rmtree(adir)
+        meta_path = os.path.splitext(filepath)[0] + ".meta.json"
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
         os.remove(filepath)
         print(f"\n\033[1;31mDeleted '{story_name}'.\033[0m")
         time.sleep(1)
@@ -765,25 +837,40 @@ def speakers_menu(filepath):
                 if not new_name or new_name == old_name:
                     speakers_menu(filepath)
                     return
-                # Update transcript file
+                # Update transcript file (handle both formats)
+                fmt = _detect_format(filepath)
                 with open(filepath, 'r', encoding='utf-8') as f:
                     content = f.read()
-                content = re.sub(
-                    r'^' + re.escape(old_name) + r': ',
-                    new_name + ': ',
-                    content,
-                    flags=re.MULTILINE
-                )
+                if fmt == "bracketed":
+                    content = re.sub(
+                        r'^\[' + re.escape(old_name) + r'\]: ',
+                        '[' + new_name + ']: ',
+                        content,
+                        flags=re.MULTILINE
+                    )
+                else:
+                    content = re.sub(
+                        r'^' + re.escape(old_name) + r': ',
+                        new_name + ': ',
+                        content,
+                        flags=re.MULTILINE
+                    )
                 with open(filepath, 'w', encoding='utf-8') as f:
                     f.write(content)
-                # Update manifest — update speaker names first, then save,
-                # so ensure_manifest can match (speaker, text) correctly
+                # Update manifest
                 old_manifest = load_manifest(filepath)
                 if old_manifest:
                     for s in old_manifest["sentences"]:
                         if s["speaker"] == old_name:
                             s["speaker"] = new_name
                     save_manifest(filepath, old_manifest)
+                # Update metadata sidecar
+                meta = load_meta(filepath)
+                if meta and "speakers" in meta and old_name in meta["speakers"]:
+                    meta["speakers"][new_name] = meta["speakers"].pop(old_name)
+                    meta_path = os.path.splitext(filepath)[0] + ".meta.json"
+                    with open(meta_path, 'w', encoding='utf-8') as f:
+                        json.dump(meta, f, indent=2)
                 print(f"\033[1mRenamed '{old_name}' to '{new_name}'.\033[0m")
                 speakers_menu(filepath)
                 return
@@ -852,6 +939,11 @@ def main():
         os.makedirs(STORIES_DIR, exist_ok=True)
         dest = os.path.join(STORIES_DIR, name + ".md")
         shutil.copy2(latest, dest)
+        # Copy sidecar metadata if it exists
+        latest_meta = os.path.splitext(latest)[0] + ".meta.json"
+        if os.path.exists(latest_meta):
+            dest_meta = os.path.join(STORIES_DIR, name + ".meta.json")
+            shutil.copy2(latest_meta, dest_meta)
         print(f"Copied to {dest}\n")
         interactive_menu()
         return
@@ -881,12 +973,14 @@ def main():
 
     # --list
     if args.list:
+        meta = load_meta(args.file)
         manifest = load_manifest(args.file)
         for i, (speaker, text, lineno) in enumerate(turns):
             preview = text[:100].replace('\n', ' ')
             if len(text) > 100:
                 preview += '...'
-            print(f"  {i+1:3d}. (line {lineno:3d}) \033[1;36m{speaker}\033[0m: {preview}")
+            sc = speaker_ansi(speaker, meta)
+            print(f"  {i+1:3d}. (line {lineno:3d}) {sc}{speaker}\033[0m: {preview}")
         stats_str = ""
         if manifest:
             stats = get_render_stats(manifest)
