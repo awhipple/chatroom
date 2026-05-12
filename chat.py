@@ -127,7 +127,10 @@ def speak_text(text):
         text_q.put(s)
     text_q.put(None)
 
-    play_thread.join()
+    try:
+        play_thread.join()
+    except KeyboardInterrupt:
+        pass
 
 
 # --- Resume (commented out — needs rework for multi-speaker configs) ---
@@ -189,7 +192,10 @@ def load_config(name):
     path = os.path.join(CONFIGS_DIR, f"{name}.json")
     with open(path) as f:
         data = json.load(f)
-    return data["speakers"], data.get("order", "round_robin"), data.get("initial_prompt", "")
+    order = data.get("order", "round_robin")
+    if order not in ORDER_LABELS:
+        order = "round_robin"
+    return data["speakers"], order, data.get("initial_prompt", "")
 
 
 def list_configs():
@@ -673,12 +679,20 @@ def load_config_menu(stdscr):
 
 # ─── Main Menu ───────────────────────────────────────────────────────────────
 
+ORDER_MODES = ["round_robin", "orchestrator_llm", "orchestrator_user"]
+ORDER_LABELS = {
+    "round_robin": "Round Robin",
+    "orchestrator_llm": "Orchestrator (LLM)",
+    "orchestrator_user": "Orchestrator (User)",
+}
+
 def main_menu(stdscr):
     """Top-level menu. Returns (speakers, order) when 'Start Chat' is selected, or None to quit."""
     speakers = default_speakers()
     order = "round_robin"
     initial_prompt = ""
     config_name = None
+    main_sel = 0
 
     while True:
         if len(speakers) <= 5:
@@ -702,15 +716,17 @@ def main_menu(stdscr):
         items = [
             "Start Chat",
             speaker_item,
-            f"Order: {'Round Robin' if order == 'round_robin' else 'Orchestrator'}",
+            f"Order: {ORDER_LABELS[order]}",
             f"Initial Prompt: {prompt_preview}",
             f"Save Configuration ({config_name})" if config_name else "Save Configuration",
             "Load Configuration",
         ]
-        idx, action = curses_menu(stdscr, "Chat Client", items, allow_esc=True)
+        idx, action = curses_menu(stdscr, "Chat Client", items, allow_esc=True, start_idx=main_sel)
 
         if action == "esc":
             return None
+
+        main_sel = idx
 
         if action == "enter":
             if idx == 0:
@@ -718,11 +734,9 @@ def main_menu(stdscr):
             elif idx == 1:
                 speakers_menu(stdscr, speakers)
             elif idx == 2:
-                # Toggle order
-                if order == "round_robin":
-                    order = "orchestrator"
-                else:
-                    order = "round_robin"
+                # Cycle order mode
+                ci = ORDER_MODES.index(order)
+                order = ORDER_MODES[(ci + 1) % len(ORDER_MODES)]
             elif idx == 3:
                 # Edit initial prompt
                 result = curses_text_editor(stdscr, "Initial Prompt", initial_prompt)
@@ -931,6 +945,8 @@ def stream_llm_response(speaker, transcript, all_speakers, input_watcher=None):
         except json.JSONDecodeError:
             continue
 
+        if event.get("type") == "message_stop":
+            break
         if event.get("type") == "content_block_delta":
             delta = event.get("delta", {})
             # Skip thinking tokens
@@ -1053,6 +1069,31 @@ def _next_speaker_round_robin(speakers, turn):
     return speakers[turn % len(speakers)]
 
 
+def _pick_speaker_user(speakers):
+    """Let the user pick the next speaker from a numbered list."""
+    print("\033[2mWho speaks next?\033[0m")
+    for i, s in enumerate(speakers):
+        ctrl = "User" if s["controller"] == "user" else "LLM"
+        print(f"  \033[1m{i + 1}\033[0m. {color_ansi(s.get('color', 'White'))}{s['name']}\033[0m ({ctrl})")
+    while True:
+        try:
+            choice = input("\033[2m>\033[0m ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if choice.lower() in ("q", "quit", "esc"):
+            return None
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(speakers):
+                return speakers[idx]
+        except ValueError:
+            # Try matching by name
+            for s in speakers:
+                if s["name"].lower() == choice.lower():
+                    return s
+        print("\033[2mInvalid choice. Enter a number or name.\033[0m")
+
+
 def _next_speaker_orchestrator(speakers, transcript):
     """Ask the orchestrator LLM who speaks next. Falls back to round-robin on failure."""
     if not transcript:
@@ -1093,8 +1134,12 @@ def run_chat(speakers, order, initial_prompt=""):
     turn = 0
     while True:
         # Pick next speaker based on order mode
-        if order == "orchestrator":
+        if order == "orchestrator_llm":
             speaker = _next_speaker_orchestrator(speakers, transcript)
+        elif order == "orchestrator_user":
+            speaker = _pick_speaker_user(speakers)
+            if speaker is None:
+                break
         else:
             speaker = _next_speaker_round_robin(speakers, turn)
 
@@ -1110,7 +1155,7 @@ def run_chat(speakers, order, initial_prompt=""):
         if speaker["controller"] == "user":
             # User input
             try:
-                user_input = input(f"{color_ansi(speaker.get('color', 'White'))}{speaker['name']}:\033[0m ")
+                user_input = input(f"\001{color_ansi(speaker.get('color', 'White'))}\002{speaker['name']}:\001\033[0m\002 ")
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -1133,6 +1178,18 @@ def run_chat(speakers, order, initial_prompt=""):
         else:
             # LLM turn — watch for Escape and Space (pause)
             watcher.start()
+
+            # Probe TTS availability concurrently with LLM streaming
+            tts_available = threading.Event()
+            if speaker.get("tts", False):
+                def _probe_tts():
+                    try:
+                        requests.head(TTS_URL, timeout=2)
+                        tts_available.set()
+                    except Exception:
+                        pass
+                threading.Thread(target=_probe_tts, daemon=True).start()
+
             try:
                 text = stream_llm_response(speaker, transcript, speakers, watcher)
             except KeyboardInterrupt:
@@ -1153,8 +1210,8 @@ def run_chat(speakers, order, initial_prompt=""):
             transcript.append((speaker["name"], text))
             turn += 1
 
-            # TTS for LLM speakers with TTS enabled (watcher still active)
-            if speaker.get("tts", False) and text.strip():
+            # TTS only if probe confirmed it's up (watcher still active)
+            if tts_available.is_set() and text.strip():
                 if not watcher.escaped.is_set():
                     try:
                         speak_text(text)
